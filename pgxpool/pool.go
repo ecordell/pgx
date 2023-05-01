@@ -10,9 +10,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/puddle/v2"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/puddle/v2"
 )
 
 var defaultMaxConns = int32(4)
@@ -85,6 +86,7 @@ type Pool struct {
 	afterConnect          func(context.Context, *pgx.Conn) error
 	beforeAcquire         func(context.Context, *pgx.Conn) bool
 	afterRelease          func(*pgx.Conn) bool
+	beforeDestroy         func(context.Context, *pgx.Conn)
 	minConns              int32
 	maxConns              int32
 	maxConnLifetime       time.Duration
@@ -118,6 +120,9 @@ type Config struct {
 	// AfterRelease is called after a connection is released, but before it is returned to the pool. It must return true to
 	// return the connection to the pool or false to destroy the connection.
 	AfterRelease func(*pgx.Conn) bool
+
+	// BeforeDestroy
+	BeforeDestroy func(context.Context, *pgx.Conn)
 
 	// MaxConnLifetime is the duration since creation after which a connection will be automatically closed.
 	MaxConnLifetime time.Duration
@@ -180,6 +185,7 @@ func NewWithConfig(ctx context.Context, config *Config) (*Pool, error) {
 		afterConnect:          config.AfterConnect,
 		beforeAcquire:         config.BeforeAcquire,
 		afterRelease:          config.AfterRelease,
+		beforeDestroy:         config.BeforeDestroy,
 		minConns:              config.MinConns,
 		maxConns:              config.MaxConns,
 		maxConnLifetime:       config.MaxConnLifetime,
@@ -236,6 +242,9 @@ func NewWithConfig(ctx context.Context, config *Config) (*Pool, error) {
 			Destructor: func(value *connResource) {
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				conn := value.conn
+				if p.beforeDestroy != nil {
+					p.beforeDestroy(ctx, conn)
+				}
 				conn.Close(ctx)
 				select {
 				case <-conn.PgConn().CleanupDone():
