@@ -24,6 +24,9 @@ var (
 	defaultHealthCheckPeriod = time.Minute
 )
 
+// ErrNotAvailable is returned by TryAcquire when no connection is immediately available.
+var ErrNotAvailable = puddle.ErrNotAvailable
+
 type connResource struct {
 	conn       *pgx.Conn
 	conns      []Conn
@@ -597,6 +600,40 @@ func (p *Pool) createIdleResources(parentCtx context.Context, targetResources in
 
 // Acquire returns a connection (*Conn) from the Pool
 func (p *Pool) Acquire(ctx context.Context) (c *Conn, err error) {
+	return p.acquire(ctx, func() (*puddle.Resource[*connResource], error) {
+		return p.p.Acquire(ctx)
+	})
+}
+
+// TryAcquire acquires a connection from the Pool without blocking. If no idle
+// connection is immediately available it returns (nil, ErrNotAvailable). The
+// context is used for connection validation (ping, PrepareConn) but not for
+// waiting. If an idle connection fails health checks it is discarded and the
+// next idle connection is tried; ErrNotAvailable is returned if no healthy
+// idle connection is found.
+func (p *Pool) TryAcquire(ctx context.Context) (c *Conn, err error) {
+	// puddle.TryAcquire starts a background goroutine to create a new connection
+	// when the pool has capacity but no idle connections. That goroutine uses the
+	// context passed to TryAcquire. If that goroutine succeeds after pool.Close()
+	// has already drained the idle queue, pool.Close() deadlocks because
+	// destructWG.Done() is never called for the newly-created connection.
+	//
+	// Passing a pre-cancelled context prevents the background goroutine from
+	// establishing a real connection, so it returns immediately with an error and
+	// calls destructWG.Done(), allowing pool.Close() to proceed. The idle-resource
+	// check inside puddle.TryAcquire does not consult the context, so this does
+	// not affect the non-blocking idle-connection semantics.
+	tryCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	return p.acquire(ctx, func() (*puddle.Resource[*connResource], error) {
+		return p.p.TryAcquire(tryCtx)
+	})
+}
+
+// acquire is the shared implementation for Acquire and TryAcquire. acquireFn is
+// called to obtain a puddle resource; it controls whether the call blocks
+// (p.p.Acquire) or is non-blocking (p.p.TryAcquire).
+func (p *Pool) acquire(ctx context.Context, acquireFn func() (*puddle.Resource[*connResource], error)) (c *Conn, err error) {
 	if p.acquireTracer != nil {
 		ctx = p.acquireTracer.TraceAcquireStart(ctx, p, TraceAcquireStartData{})
 		defer func() {
@@ -612,7 +649,7 @@ func (p *Pool) Acquire(ctx context.Context) (c *Conn, err error) {
 	// any that fatal errors would empty the pool and still at least try 1 fresh
 	// connection.
 	for range int(p.maxConns) + 1 {
-		res, err := p.p.Acquire(ctx)
+		res, err := acquireFn()
 		if err != nil {
 			return nil, err
 		}

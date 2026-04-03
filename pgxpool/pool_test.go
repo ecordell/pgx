@@ -285,6 +285,69 @@ func TestPoolAcquireFunc(t *testing.T) {
 	require.EqualValues(t, 1, n)
 }
 
+func TestPoolTryAcquireIdleConn(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	defer pool.Close()
+
+	// Seed an idle connection by acquiring and releasing one.
+	seed, err := pool.Acquire(ctx)
+	require.NoError(t, err)
+	seed.Release()
+
+	c, err := pool.TryAcquire(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, c)
+	c.Release()
+}
+
+func TestPoolTryAcquireNoIdleConns(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	config, err := pgxpool.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	config.MaxConns = 1
+
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	// Hold the only connection so the pool is fully busy.
+	busy, err := pool.Acquire(ctx)
+	require.NoError(t, err)
+	defer busy.Release()
+
+	c, err := pool.TryAcquire(ctx)
+	require.Nil(t, c)
+	require.ErrorIs(t, err, pgxpool.ErrNotAvailable)
+}
+
+func TestPoolTryAcquireNoIdleConnsPoolHasCapacity(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	// Pool has capacity (MaxConns > 1) but no idle connections yet.
+	pool, err := pgxpool.New(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	defer pool.Close()
+
+	// Don't seed any connections — pool is empty but has room to grow.
+	c, err := pool.TryAcquire(ctx)
+	require.Nil(t, c)
+	require.ErrorIs(t, err, pgxpool.ErrNotAvailable)
+}
+
+
 func TestPoolAcquireFuncReturnsFnError(t *testing.T) {
 	t.Parallel()
 
